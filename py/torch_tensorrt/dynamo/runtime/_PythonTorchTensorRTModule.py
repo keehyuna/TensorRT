@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from tempfile import tempdir
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import tensorrt as trt
 import torch
@@ -77,6 +77,8 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         self.cudagraph: Optional[torch.cuda.CUDAGraph] = None
         self._caller_stream: Optional[torch.cuda.Stream] = None
         self._engine_stream: Optional[torch.cuda.Stream] = None
+        self.weight_streaming_budget = 0
+        self.streamable_weights_size = 0
 
         # TODO: Make the below a Dictionary {shape: cudagraph}
         self.shape_key: Optional[str] = None
@@ -109,10 +111,123 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         if self.serialized_engine is not None and not self.settings.lazy_engine_init:
             self.setup_engine()
 
+    def set_weight_streaming_budget(self) -> None:
+        budget_bytes = None
+        weight_streaming_percent = None
+        if self.settings.weight_streaming_setting == "disabled":
+            return
+        elif self.settings.weight_streaming_setting == "auto":
+            budget_bytes = 0
+        elif self.settings.weight_streaming_setting.endswith("%"):
+            weight_streaming_percent_str = self.settings.weight_streaming_setting[:-1]
+            weight_streaming_percent = int(weight_streaming_percent_str)
+            assert 0 <= weight_streaming_percent <= 100
+        elif self.settings.weight_streaming_setting.isdecimal():
+            budget_bytes = int(self.settings.weight_streaming_setting)
+        else:
+            raise RuntimeError(
+                f"Invalid weight_streaming_setting format: {self.settings.weight_streaming_setting}"
+            )
+
+        if trt.__version__ >= "10.1":
+            self.set_weight_streaming_budget_v2(budget_bytes, weight_streaming_percent)
+        else:
+            self.set_weight_streaming_budget_v1(budget_bytes, weight_streaming_percent)
+
+    def set_weight_streaming_budget_v2(
+        self,
+        budget_bytes: Union[None, int],
+        weight_streaming_percent: Union[None, int],
+    ) -> None:
+        if budget_bytes is not None:
+            if budget_bytes == 0:
+                budget_bytes_to_set = (
+                    self.engine.get_weight_streaming_automatic_budget()
+                )
+                print(
+                    f"Weight streaming is enabled with TensorRT automatically determiing the budget {budget_bytes}."
+                )
+        elif weight_streaming_percent is not None:
+            budget_bytes_to_set = (
+                weight_streaming_percent / 100.0 * (self.engine.streamable_weights_size)
+            )
+        else:
+            raise RuntimeError(
+                "Invalid usage. both budget_bytes and weight_streaming_percent are None"
+            )
+
+        budget_bytes = int(budget_bytes_to_set)
+        self.engine.weight_streaming_budget_v2 = budget_bytes
+        if self.engine.weight_streaming_budget_v2 != budget_bytes:
+            RuntimeError(f"Failed to set weight streaming budget to {budget_bytes}!")
+        if budget_bytes == self.engine.streamable_weights_size:
+            print("Weight streaming is disabled.")
+        else:
+            print(
+                f"Weight streaming is enabled with a memory budget of {budget_bytes} bytes."
+            )
+            self.weight_streaming_budget = budget_bytes
+            self.streamable_weights_size = self.engine.streamable_weights_size
+
+        weight_streaming_scratch_memory_size = (
+            self.engine.weight_streaming_scratch_memory_size
+        )
+        device_memory_size_v2 = self.engine.device_memory_size_v2
+
+        print(
+            f"streamable_weights_size =  {self.engine.streamable_weights_size} bytes."
+        )
+        print(
+            f"weight_streaming_scratch_memory_size =  {weight_streaming_scratch_memory_size} bytes."
+        )
+        print(f"device_memory_size_v2 =  {device_memory_size_v2} bytes.")
+
+    def set_weight_streaming_budget_v1(
+        self,
+        budget_bytes: Union[None, int],
+        weight_streaming_percent: Union[None, int],
+    ) -> None:
+        if budget_bytes == 0:
+            # TRT to choose to weight stream automatically
+            budget_bytes = -1
+        elif weight_streaming_percent is not None:
+            if weight_streaming_percent == 0:
+                budget_bytes = 0  # Disable weight streaming
+            else:
+                min_budget = self.engine.minimum_weight_streaming_budget
+                max_budget = self.engine.streamable_weights_size
+                budget_bytes = (1 - weight_streaming_percent / 100.0) * (
+                    max_budget - min_budget
+                ) + min_budget
+
+        if budget_bytes is not None:
+            budget_bytes = int(budget_bytes)
+            self.engine.weight_streaming_budget = budget_bytes
+            if self.engine.weight_streaming_budget != budget_bytes:
+                RuntimeError(
+                    f"Failed to set weight streaming budget to {budget_bytes}!"
+                )
+            if budget_bytes == 0:
+                print("Weight streaming is disabled.")
+            elif budget_bytes == -1:
+                print(
+                    "Weight streaming is enabled with TensorRT automatically determiing the budget."
+                )
+            else:
+                print(
+                    f"Weight streaming is enabled with a memory budget of {budget_bytes} bytes."
+                )
+                self.weight_streaming_budget = budget_bytes
+                self.streamable_weights_size = (
+                    self.engine.minimum_weight_streaming_budget
+                )
+
     def setup_engine(self) -> None:
         self.initialized = True
         runtime = trt.Runtime(TRT_LOGGER)
         self.engine = runtime.deserialize_cuda_engine(self.serialized_engine)
+        self.set_weight_streaming_budget()
+
         self.context = self.engine.create_execution_context()
 
         assert self.engine.num_io_tensors == (

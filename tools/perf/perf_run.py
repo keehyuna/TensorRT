@@ -77,10 +77,12 @@ def run_ts_trt(model, input_tensors, params, precision, batch_size):
         batch_size,
     )
     # Compiling Torch-TensorRT model
+    weight_streaming_percent = params.get("weight_streaming_percent", "100%")
     compile_settings = {
         "inputs": input_tensors,
         "enabled_precisions": {precision_to_dtype(precision)},
         "truncate_long_and_double": params.get("truncate", False),
+        "weight_streaming_setting": weight_streaming_percent,
     }
 
     if precision == "int8":
@@ -110,7 +112,12 @@ def run_ts_trt(model, input_tensors, params, precision, batch_size):
             timings.append(meas_time)
 
     recordStats(
-        "Torch-TensorRT [Torchscript]", timings, precision, batch_size, compile_time_s
+        "Torch-TensorRT [Torchscript]",
+        timings,
+        precision,
+        batch_size,
+        compile_time_s,
+        weight_streaming_percent,
     )
 
 
@@ -126,6 +133,7 @@ def run_dynamo(model, input_tensors, params, precision, batch_size):
         batch_size,
     )
     start_compile = time.time_ns()
+    weight_streaming_percent = params.get("weight_streaming_percent", "100%")
     model = torchtrt.compile(
         model,
         inputs=input_tensors,
@@ -134,10 +142,21 @@ def run_dynamo(model, input_tensors, params, precision, batch_size):
         min_block_size=params.get("min_block_size", 1),
         debug=False,
         truncate_long_and_double=params.get("truncate", False),
+        use_python_runtime=True,
+        weight_streaming_setting=weight_streaming_percent,
     )
     end_compile = time.time_ns()
     compile_time_s = (end_compile - start_compile) / 1e9
     iters = params.get("iterations", 20)
+
+    weight_streaming_budget = []
+    for name, mod in model.named_children():
+        if "_run_on_acc" in name:
+            weight_streaming_budget.append(
+                (mod.weight_streaming_budget, mod.streamable_weights_size)
+            )
+    # TODO
+    assert len(weight_streaming_budget) == 1
     # Warm up
     with torch.no_grad():
         for _ in range(WARMUP_ITER):
@@ -156,7 +175,13 @@ def run_dynamo(model, input_tensors, params, precision, batch_size):
             timings.append(meas_time)
 
     recordStats(
-        "Torch-TensorRT [Dynamo]", timings, precision, batch_size, compile_time_s
+        "Torch-TensorRT [Dynamo]",
+        timings,
+        precision,
+        batch_size,
+        compile_time_s,
+        weight_streaming_percent,
+        weight_streaming_budget,
     )
 
 
@@ -173,11 +198,14 @@ def run_torch_compile(model, input_tensors, params, precision, batch_size):
         " batch_size : ",
         batch_size,
     )
+    weight_streaming_percent = params.get("weight_streaming_percent", "100%")
     compile_spec = {
         "inputs": input_tensors,
         "enabled_precisions": {precision_to_dtype(precision)},
         "truncate_long_and_double": params.get("truncate", False),
         "min_block_size": params.get("min_block_size", 1),
+        "use_python_runtime": True,
+        "weight_streaming_setting": weight_streaming_percent,
     }
     start_compile = time.time_ns()
     model = torch.compile(
@@ -212,6 +240,7 @@ def run_torch_compile(model, input_tensors, params, precision, batch_size):
         precision,
         batch_size,
         compile_time_s,
+        weight_streaming_percent,
     )
 
 
@@ -260,6 +289,7 @@ def run_inductor(model, input_tensors, params, precision, batch_size):
         precision,
         batch_size,
         compile_time_s,
+        streamable_weights_size,
     )
 
 
@@ -444,7 +474,15 @@ def run(
 
 
 # Generate report
-def recordStats(backend, timings, precision, batch_size=1, compile_time_s=None):
+def recordStats(
+    backend,
+    timings,
+    precision,
+    batch_size=1,
+    compile_time_s=None,
+    weight_streaming_percent="N/A",
+    weight_streaming_budget_list=[],
+):
     times = np.array(timings)
     steps = len(times)
     speeds = batch_size / times
@@ -454,11 +492,18 @@ def recordStats(backend, timings, precision, batch_size=1, compile_time_s=None):
     time_std = np.std(times, ddof=0)
     speed_mean = np.mean(speeds)
     speed_med = np.median(speeds)
-
+    weight_streaming_budget = 0
+    streamable_weights_size = 0
+    if len(weight_streaming_budget_list) > 0:
+        weight_streaming_budget = weight_streaming_budget_list[0][0]
+        streamable_weights_size = weight_streaming_budget_list[0][1]
     stats = {
         "Backend": backend,
         "Precision": precision,
         "Batch size": batch_size,
+        "weight_streaming_percent": weight_streaming_percent,
+        "weight_streaming_budget": weight_streaming_budget,
+        "streamable_weights_size": streamable_weights_size,
         "Median(FPS)": speed_med,
         "Mean(FPS)": speed_mean,
         "Median-Latency(ms)": time_med * 1000,
@@ -521,6 +566,11 @@ if __name__ == "__main__":
         "--report",
         type=str,
         help="Path of the output file where performance summary is written.",
+    )
+    arg_parser.add_argument(
+        "--weight_streaming_percent",
+        type=str,
+        help="The percentage of streaming weights that TRT keeps on the GPU.",
     )
     args = arg_parser.parse_args()
 

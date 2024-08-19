@@ -83,6 +83,7 @@ def compile(
     hardware_compatible: bool = _defaults.HARDWARE_COMPATIBLE,
     timing_cache_path: str = _defaults.TIMING_CACHE_PATH,
     lazy_engine_init: bool = _defaults.LAZY_ENGINE_INIT,
+    weight_streaming_setting: str = _defaults.STREAMABLE_WEIGHTS_DISABLED,
     **kwargs: Any,
 ) -> torch.fx.GraphModule:
     """Compile an ExportedProgram module for NVIDIA GPUs using TensorRT
@@ -148,6 +149,11 @@ def compile(
         hardware_compatible (bool): Build the TensorRT engines compatible with GPU architectures other than that of the GPU on which the engine was built (currently works for NVIDIA Ampere and newer)
         timing_cache_path (str): Path to the timing cache if it exists (or) where it will be saved after compilation
         lazy_engine_init (bool): Defer setting up engines until the compilation of all engines is complete. Can allow larger models with multiple graph breaks to compile but can lead to oversubscription of GPU memory at runtime.
+        weight_streaming_setting(str): GPU memory TensorRT can use for weights at runtime. valid setting format is
+                                       disabled: disabled
+                                       auto: TensorRT will decide the streaming budget automatically.
+                                       0% to 100%: The percentage of weights that TRT keeps on the GPU.
+                                       positive integer : The exact amount of streamable weights that reside on the GPU
         **kwargs: Any,
     Returns:
         torch.fx.GraphModule: Compiled FX Module, when run it will execute via TensorRT
@@ -257,6 +263,7 @@ def compile(
         "hardware_compatible": hardware_compatible,
         "timing_cache_path": timing_cache_path,
         "lazy_engine_init": lazy_engine_init,
+        "weight_streaming_setting": weight_streaming_setting,
     }
 
     settings = CompilationSettings(**compilation_options)

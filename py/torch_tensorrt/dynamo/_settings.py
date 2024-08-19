@@ -25,6 +25,7 @@ from torch_tensorrt.dynamo._defaults import (
     PASS_THROUGH_BUILD_FAILURES,
     REQUIRE_FULL_COMPILATION,
     SPARSE_WEIGHTS,
+    STREAMABLE_WEIGHTS_DISABLED,
     TIMING_CACHE_PATH,
     TRUNCATE_DOUBLE,
     USE_FAST_PARTITIONER,
@@ -106,3 +107,4 @@ class CompilationSettings:
     hardware_compatible: bool = HARDWARE_COMPATIBLE
     timing_cache_path: str = TIMING_CACHE_PATH
     lazy_engine_init: bool = LAZY_ENGINE_INIT
+    weight_streaming_setting: str = STREAMABLE_WEIGHTS_DISABLED
