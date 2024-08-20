@@ -10,6 +10,7 @@ from torch_tensorrt.dynamo.conversion import impl
 from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContext
 from torch_tensorrt.dynamo.conversion.converter_utils import (
     SourceIR,
+    cast_trt_tensor,
     extend_attr_to_tuple,
     get_trt_tensor,
     to_numpy,
@@ -92,13 +93,16 @@ def convNd(
         kernel=trt.Weights() if isinstance(weight, TRTTensor) else weight,
         bias=trt.Weights() if isinstance(bias, TRTTensor) else bias,
     )
-
     # If the weight is a TRTTensor, set it as an input of the layer
     if isinstance(weight, TRTTensor):
+        if ctx.net.get_flag(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED):
+            weight = cast_trt_tensor(ctx, weight, input.dtype, name)
         conv_layer.set_input(1, weight)
 
     # If the bias is a TRTTensor, set it as an input of the layer
     if isinstance(bias, TRTTensor):
+        if ctx.net.get_flag(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED):
+            bias = cast_trt_tensor(ctx, bias, input.dtype, name)
         conv_layer.set_input(2, bias)
 
     # Cast certain fields to tuples, in accordance with TRT requirements
