@@ -133,12 +133,18 @@ def run_dynamo(model, input_tensors, params, precision, batch_size):
         batch_size,
     )
     start_compile = time.time_ns()
-    weight_streaming_percent = params.get("weight_streaming_percent", "100%")
+    weight_streaming_percent = params.get("weight_streaming_percent", "disabled")
+    if weight_streaming_percent != "disabled":
+        precision = {}
+        print("enabled_precisions option is disabled for weight streaming")
+    else:
+        precision = {precision_to_dtype(precision)}
+
     model = torchtrt.compile(
         model,
         inputs=input_tensors,
         ir="dynamo",
-        enabled_precisions={precision_to_dtype(precision)},
+        enabled_precisions=precision,
         min_block_size=params.get("min_block_size", 1),
         debug=False,
         truncate_long_and_double=params.get("truncate", False),

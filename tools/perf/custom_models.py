@@ -30,6 +30,6 @@ def StableDiffusionUnet():
     from diffusers import DiffusionPipeline
 
     pipe = DiffusionPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4", revision="fp16", torch_dtype=torch.float16
+        "runwayml/stable-diffusion-v1-5", revision="fp16", torch_dtype=torch.float16
     )
     return pipe.unet
