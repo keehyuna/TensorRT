@@ -60,9 +60,8 @@ RTDevice select_rt_device(const RTDevice& engine_device, const RTDevice& curr_de
   return new_target_device_opt.value();
 }
 
-bool _cudagraphs_validate_shapes(std::vector<at::Tensor> inputs, c10::intrusive_ptr<TRTEngine> compiled_engine) {
-  // Validate whether the current input shapes to the engine
-  // invalidate the existing cudagraphs object
+bool _validate_shapes(std::vector<at::Tensor> inputs, c10::intrusive_ptr<TRTEngine> compiled_engine) {
+  // Validate whether the current input shapes to the engine has changed
 
   // Populate the shape key for the inputs
   // x: (3, 4), y: (4, 5) --> Key: (3,4)(4,5)
@@ -83,15 +82,13 @@ bool _cudagraphs_validate_shapes(std::vector<at::Tensor> inputs, c10::intrusive_
 
   auto new_shape_key = new_shape_key_ss.str();
 
-  // Compare the shape key to the original key and invalidate shapes if they do not match
+  // Compare the shape key to the original key
   if (new_shape_key != compiled_engine->shape_key) {
-    LOG_DEBUG("Resetting Cudagraph on New Shape Key " << new_shape_key);
-    compiled_engine->shape_key = new_shape_key;
-    compiled_engine->cudagraph.reset();
-    return false;
+    LOG_DEBUG("Input shape changed " << compiled_engine->shape_key << " -> " << new_shape_key);
+    return true;
   }
 
-  return true;
+  return false;
 }
 
 std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intrusive_ptr<TRTEngine> compiled_engine) {
@@ -114,10 +111,14 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     compiled_engine->cudagraph.enable_debug_mode();
   }
 
+  bool shape_changed = _validate_shapes(inputs, compiled_engine);
   // Whether cudagraphs needs to record the graph on this pass
-  bool need_cudagraphs_record = (CUDAGRAPHS_MODE && (!_cudagraphs_validate_shapes(inputs, compiled_engine)));
+  // Cudagraphs record is required if cudagraphs_enabled is toggled to True regardless of shape change
+  bool need_cudagraphs_record = (((!compiled_engine->cudagraphs_enabled) && CUDAGRAPHS_MODE) ||
+                                 (CUDAGRAPHS_MODE && shape_changed));
+  compiled_engine->cudagraphs_enabled = CUDAGRAPHS_MODE;
 
-  if (!CUDAGRAPHS_MODE) {
+  if (!CUDAGRAPHS_MODE || shape_changed) {
     compiled_engine->cudagraph.reset();
   }
 
@@ -257,6 +258,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
             << " cannot be inferred. This could happen if the input tensor addresses/shapes haven't been configured correctly");
   }
 
+  if (shape_changed)
   { // Output Setup
     std::unique_ptr<torch::autograd::profiler::RecordProfile> output_profiler_guard;
     if (compiled_engine->profile_execution) {
@@ -276,21 +278,13 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
       auto type = util::TRTDataTypeToScalarType(compiled_engine->exec_ctx->getEngine().getTensorDataType(name.c_str()));
       outputs[pyt_idx] = std::move(at::empty(dims, {at::kCUDA}).to(type).contiguous());
 
-      if (need_cudagraphs_record) {
-        // If we are recording the cuda graph then we need to update the persistent output buffer
-        compiled_engine->output_buffers[pyt_idx] = std::move(outputs[pyt_idx].clone());
-      }
+      // Create and keep persistent output buffer as long as its shape does not change
+      compiled_engine->output_buffers[pyt_idx] = std::move(outputs[pyt_idx].clone());
 
-      if (CUDAGRAPHS_MODE) {
-        TORCHTRT_CHECK(
-            compiled_engine->exec_ctx->setTensorAddress(
-                name.c_str(), compiled_engine->output_buffers[pyt_idx].data_ptr()),
-            "Error while setting the output tensor address");
-      } else {
-        TORCHTRT_CHECK(
-            compiled_engine->exec_ctx->setTensorAddress(name.c_str(), outputs[pyt_idx].data_ptr()),
-            "Error while setting the output tensor address");
-      }
+      TORCHTRT_CHECK(
+          compiled_engine->exec_ctx->setTensorAddress(
+              name.c_str(), compiled_engine->output_buffers[pyt_idx].data_ptr()),
+          "Error while setting the output tensor address");
     }
   }
 
@@ -350,7 +344,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
   trt_exec_complete.record(compiled_engine->engine_stream);
   trt_exec_complete.block(compiled_engine->caller_stream);
 
-  if (CUDAGRAPHS_MODE) {
+  if (0) {
     // If in CUDAGraph mode, results need to be copied to the result buffers (on caller stream)
     for (size_t o = 0; o < compiled_engine->output_buffers.size(); o++) {
       outputs[o].copy_(compiled_engine->output_buffers[o], false);
@@ -363,7 +357,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     compiled_engine->dump_engine_layer_info();
   }
 
-  return outputs;
+  return compiled_engine->output_buffers;
 }
 
 } // namespace runtime

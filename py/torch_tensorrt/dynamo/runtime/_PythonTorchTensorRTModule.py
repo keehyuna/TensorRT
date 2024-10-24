@@ -22,7 +22,6 @@ from torch_tensorrt.runtime._utils import (
 
 logger = logging.getLogger(__name__)
 
-
 class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
     """PythonTorchTensorRTModule is a PyTorch module which encompasses an arbitrary TensorRT Engine.
 
@@ -107,6 +106,7 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         self.engine = None
         self.weight_name_map = weight_name_map
         self.target_platform = Platform.current_platform()
+        self.cudagraphs_enabled = False
 
         if self.serialized_engine is not None and not self.settings.lazy_engine_init:
             self.setup_engine()
@@ -246,20 +246,25 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         ):
             self._check_initialized()
 
+            shape_changed = self.validate_input_shapes(inputs)
             cudagraphs_enabled = torch_tensorrt.runtime.get_cudagraphs_mode()
-            need_cudagraphs_record = (
-                cudagraphs_enabled and not self.cudagraphs_validate_shapes(inputs)
-            )
+            # Cudagraphs record is required if cudagraphs_enabled is toggled to True regardless of shape change
+            if not self.cudagraphs_enabled and cudagraphs_enabled:
+                need_cudagraphs_record = True
+            else:    
+                need_cudagraphs_record = (cudagraphs_enabled and shape_changed)
+            self.cudagraphs_enabled = cudagraphs_enabled
 
             if need_cudagraphs_record:
+                if self.cudagraph:
+                    self.cudagraph.reset()
                 self._input_buffers = [None] * len(self.input_names)
-                self._output_buffers = [None] * len(self.output_names)
 
             if not cudagraphs_enabled and self.cudagraph:
                 self.cudagraph.reset()
                 self.cudagraph = None
 
-            # If in safe mode, check at each iteration for for whether a switch is required
+            # If in safe mode, check at each iteration for whether a switch is required
             if (
                 torch_tensorrt.runtime._multi_device_safe_mode._PY_RT_MULTI_DEVICE_SAFE_MODE
             ):
@@ -358,20 +363,11 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                         f"The shapes of the inputs: {uninferred_input_names} cannot be inferred and could lead to undefined behavior. \
                                 This could happen if the input tensor addresses/shapes haven't been configured correctly"
                     )
-
-            with (
-                torch.autograd.profiler.record_function(
-                    "PythonTorchTensorRTModule:ProcessOutputs"
-                )
-                if self.profiling_enabled
-                else nullcontext()
-            ):
-                # create output tensors
-                outputs: List[torch.Tensor] = []
-
+            if shape_changed:
+                # Create and keep persistent output buffer as long as its shape does not change
+                self._output_buffers = []
                 for o, output_name in enumerate(self.output_names):
                     shape = tuple(self.context.get_tensor_shape(output_name))
-
                     if DYNAMIC_DIM in shape:
                         raise ValueError(
                             "Encountered dynamic output shapes during runtime. This could mean the network has data-dependent output shapes which is not currently supported."
@@ -383,19 +379,10 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                         device=torch.cuda.current_device(),
                     )
 
-                    outputs.append(output)
-
-                    if need_cudagraphs_record:
-                        self._output_buffers[o] = outputs[o].clone()
-
-                    if cudagraphs_enabled:
-                        self.context.set_tensor_address(
-                            output_name, self._output_buffers[o].data_ptr()
-                        )
-                    else:
-                        self.context.set_tensor_address(
-                            output_name, outputs[o].data_ptr()
-                        )
+                    self.context.set_tensor_address(
+                        output_name, output.data_ptr()
+                    )
+                    self._output_buffers.append(output)
 
             with (
                 torch.autograd.profiler.record_function(
@@ -444,14 +431,10 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
 
                 self._caller_stream.wait_stream(self._engine_stream)
 
-            if cudagraphs_enabled:
-                for idx, o in enumerate(outputs):
-                    o.copy_(self._output_buffers[idx])
+            if len(self._output_buffers) == 1:
+                return self._output_buffers[0]
 
-            if len(outputs) == 1:
-                return outputs[0]
-
-            return outputs
+            return self._output_buffers
 
     def enable_profiling(self, profiler: "trt.IProfiler" = None) -> None:
         """
@@ -485,10 +468,9 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         )
         return engine_json
 
-    def cudagraphs_validate_shapes(self, inputs: Sequence[torch.Tensor]) -> bool:
+    def validate_input_shapes(self, inputs: Sequence[torch.Tensor]) -> bool:
         """
-        Validates the input shapes of the forward function
-        versus the version currently active for the
+        Validates the input shapes of the forward function has changed
         """
         # Representation of input shapes to a given model
         # Shapes are concatenated as so:
@@ -498,10 +480,8 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         # If the new shape key differs from the existing one,
         # invalidate the old shape key and remove the CUDAGraph
         if new_shape_key != self.shape_key:
-            logger.debug(f"Resetting Cudagraph on new shape key {new_shape_key}")
+            logger.debug(f"Input shape changed {self.shape_key} -> {new_shape_key}")
             self.shape_key = new_shape_key
-            if self.cudagraph:
-                self.cudagraph.reset()
-            return False
+            return True
 
-        return True
+        return False
