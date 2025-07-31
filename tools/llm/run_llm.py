@@ -151,12 +151,14 @@ def print_outputs(backend_name, gen_tokens, tokenizer):
     """
     Print the generated tokens from the model.
     """
+    out = tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
     print(f"========= {backend_name} =========")
     print(
         f"{backend_name} model generated text: ",
-        tokenizer.decode(gen_tokens[0], skip_special_tokens=True),
+        out,
     )
     print("===================================")
+    return out
 
 
 def measure_perf(trt_model, input_signature, backend_name):
@@ -371,26 +373,29 @@ if __name__ == "__main__":
                 compile_time_s=None,
             )
         match_result = "N/A"
+        torch_out = "N/A"
         model_name = args.model.replace("/", "_")
         qformat = args.qformat if args.qformat else "no_quant"
 
         if not args.benchmark:
             if args.enable_pytorch_run:
-                print_outputs("PyTorch", pyt_gen_tokens, tokenizer)
+                torch_out = print_outputs("PyTorch", pyt_gen_tokens, tokenizer)
 
-            print_outputs("TensorRT", trt_gen_tokens, tokenizer)
+            trt_out = print_outputs("TensorRT", trt_gen_tokens, tokenizer)
 
             if args.enable_pytorch_run:
                 print(
                     f"PyTorch and TensorRT outputs match: {torch.equal(pyt_gen_tokens, trt_gen_tokens)}"
                 )
                 match_result = str(torch.equal(pyt_gen_tokens, trt_gen_tokens))
-                out_json_file = f"{model_name}_{qformat}_match.json"
-                result = {}
-                result["match"] = match_result
-                with open(os.path.join("result", out_json_file), "w") as f:
-                    json.dump(result, f, indent=4)
-                    print(f"Results saved to {out_json_file}")
+            out_json_file = f"{model_name}_{qformat}_match.json"
+            result = {}
+            result["match"] = match_result
+            result["torch_out"] = torch_out
+            result["trt_out"] = trt_out
+            with open(os.path.join("result", out_json_file), "w") as f:
+                json.dump(result, f, indent=4)
+                print(f"Results saved to {out_json_file}")
         if args.benchmark:
             result = {}
             args_dict = vars(args)
@@ -399,7 +404,7 @@ if __name__ == "__main__":
             result["pyt_stats"] = pyt_stats if args.enable_pytorch_run else None
             result["trt_stats"] = trt_stats if args.benchmark else None
             out_json_file = f"{model_name}_{qformat}_benchmark.json"
-            with open(os.path.join("result0731", out_json_file), "w") as f:
+            with open(os.path.join("result", out_json_file), "w") as f:
                 json.dump(result, f, indent=4)
                 print(f"Results saved to {out_json_file}")
             if args.enable_pytorch_run:
