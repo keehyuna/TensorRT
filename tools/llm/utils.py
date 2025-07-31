@@ -1,22 +1,25 @@
 import copy
-import timeit
 import os
+import timeit
+
+import huggingface_hub
+import modelopt.torch.quantization as mtq
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
+from modelopt.torch.quantization.utils import export_torch_mode
+from modelopt.torch.utils.dataset_utils import (
+    create_forward_loop,
+    get_dataset_dataloader,
+)
+from safetensors import safe_open
 from transformers import StoppingCriteriaList
 from transformers.generation.stopping_criteria import (
     EosTokenCriteria,
     MaxLengthCriteria,
 )
-import modelopt.torch.quantization as mtq
-from modelopt.torch.utils.dataset_utils import (
-    create_forward_loop,
-    get_dataset_dataloader,
-)
-from modelopt.torch.quantization.utils import export_torch_mode
-import huggingface_hub
-from huggingface_hub import snapshot_download
-from safetensors import safe_open
+
+
 def export_llm(model, inputs, min_seq_len=1, max_seq_len=16):
     """
     Exports the LLM model into an ExportedProgram with dynamic shapes.
@@ -251,114 +254,188 @@ def record_stats(backend, timings, precision, batch_size=1, compile_time_s=None)
     }
     return stats
 
-def quantize_model(model, tokenizer):
+
+def quantize_model(model, args, tokenizer):
     calib_dataloader = get_dataset_dataloader(
         tokenizer=tokenizer,
         batch_size=32,
         num_samples=512,
         device=torch.device("cuda:0"),
     )
-
-    quant_cfg = mtq.FP8_DEFAULT_CFG
+    if args.qformat == "fp8":
+        quant_cfg = mtq.FP8_DEFAULT_CFG
+    else:
+        raise RuntimeError("Unsupported quantization format")
     calibrate_loop = create_forward_loop(dataloader=calib_dataloader)
 
     model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
-    print(f"Quantization done.")
+    if args.debug:
+        mtq.print_quant_summary(model)
 
     return model
 
+
 quantize_op = torch.ops.tensorrt.quantize_op
 
+
 class TensorRTQuantizedLinear(torch.nn.Module):
-    """TensorRT quantized linear layer."""
-    
+    """
+    TensorRT quantized linear layer that applies FP8 quantization to both input and weight.
+
+    This class implements a quantized linear layer that:
+    1. Applies QDQ (Quantize-Dequantize) to input tensor using FP8 E4M3 format
+    2. Applies QDQ (Quantize-Dequantize) to weight tensor using FP8 E4M3 format
+    3. Performs linear operation with dequantized tensors
+
+    The quantize_op function handles the complete QDQ pattern internally,
+    returning dequantized tensors that maintain precision while reducing memory usage.
+    """
+
     def __init__(self, original_linear: torch.nn.Linear, input_amax, weight_amax):
+        """
+        Initialize quantized linear layer.
+
+        Args:
+            original_linear: Original PyTorch linear layer to quantize
+            input_amax: Maximum absolute value for input quantization scaling
+            weight_amax: Maximum absolute value for weight quantization scaling
+        """
         super().__init__()
+
+        # Store reference to original linear layer for weight access
         self.original_linear = original_linear
-        
-        # Copy the original weights and bias
-        #self.weight = nn.Parameter(original_linear.weight.clone()).cuda()
+
+        # Copy bias from original layer if it exists
         if original_linear.bias is not None:
             self.bias = torch.nn.Parameter(original_linear.bias.clone()).cuda()
         else:
             self.bias = None
-        
-        # Quantization parameters
+
+        # These control the quantization scaling for input and weight tensors
         self.input_amax = torch.nn.Parameter(input_amax).cuda()
         self.weight_amax = torch.nn.Parameter(weight_amax).cuda()
-    
+
     def forward(self, x):
-        # Quantized forward pass
-        x_quantized = quantize_op(
-            x, self.input_amax, num_bits=8, exponent_bits=4, unsigned=False, narrow_range=False
-        )
-        #weight = (self.weight * self.weight_scale).to(torch.float32)
-        quantized_weight = quantize_op(
-            self.original_linear.weight, self.weight_amax, num_bits=8, exponent_bits=4, unsigned=False, narrow_range=False
+        """
+        Forward pass with FP8 QDQ quantization.
+
+        Args:
+            x: Input tensor of shape (batch_size, in_features)
+
+        Returns:
+            Output tensor of shape (batch_size, out_features)
+        """
+        # Step 1: Apply QDQ to input tensor using FP8 E4M3 format
+        # quantize_op performs: Quantize -> Dequantize, returning dequantized tensor
+        x_dequantized = quantize_op(
+            x,
+            self.input_amax,
+            num_bits=8,
+            exponent_bits=4,
+            unsigned=False,
+            narrow_range=False,
         )
 
-        # Perform quantized linear operation
-        return torch.nn.functional.linear(x_quantized, quantized_weight, self.bias)
-        
-    
-def download_hf_model(model: str):
-    ignore_patterns = ["original/**/*"]
-    
-    hf_folder = snapshot_download(
-        model,
-        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        ignore_patterns=ignore_patterns,
-        revision=None)
-    return hf_folder
+        # Step 2: Apply QDQ to weight tensor using FP8 E4M3 format
+        # quantize_op performs: Quantize -> Dequantize, returning dequantized tensor
+        weight_dequantized = quantize_op(
+            self.original_linear.weight,
+            self.weight_amax,
+            num_bits=8,
+            exponent_bits=4,
+            unsigned=False,
+            narrow_range=False,
+        )
+
+        # Step 3: Perform linear operation with dequantized tensors
+        # Both tensors are now dequantized, maintaining precision while reducing memory
+        return torch.nn.functional.linear(x_dequantized, weight_dequantized, self.bias)
+
 
 def convert_linear_to_tensorrt_quantized(model, model_name):
+    """
+    Convert linear layers in a model to TensorRT quantized versions using FP8 quantization.
+
+    This function:
+    1. Loads quantization scales from Hugging Face model files
+    2. Replaces standard linear layers with TensorRTQuantizedLinear layers
+    3. Applies FP8 E4M3 quantization to both input and weight tensors
+
+    Args:
+        model: PyTorch model to quantize
+        model_name: Path to Hugging Face model or model identifier
+
+    Returns:
+        Model with quantized linear layers
+    """
+    # Determine if model_name is a local directory or needs to be downloaded
     if os.path.isdir(model_name):
         hf_folder = model_name
     else:
-        hf_folder = download_hf_model(model_name)
-    tensors = {}
+        # Download model from Hugging Face Hub
+        hf_folder = snapshot_download(
+            model_name,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            ignore_patterns=["original/**/*"],
+            revision=None,
+        )
+
+    # Load all tensors from SafeTensors files
+    scale_tensors = {}
     for file in os.listdir(hf_folder):
         if file.endswith(".safetensors"):
-            with safe_open(os.path.join(hf_folder, file), framework="pt", device="cpu") as f:
-                # Get all tensor names
+            with safe_open(
+                os.path.join(hf_folder, file), framework="pt", device="cpu"
+            ) as f:
                 tensor_names = f.keys()
-                print(f"Available tensors: {tensor_names}")
                 for name in tensor_names:
-                    tensors[name] = f.get_tensor(name)
+                    if name.endswith(".weight_scale") or name.endswith(".input_scale"):
+                        scale_tensors[name] = f.get_tensor(name)
 
+    # Iterate through all modules in the model
     for name, module in model.named_modules():
+        # Check if the module is a linear layer
         target = torch.nn.modules.linear.Linear
         if isinstance(module, target):
-            #print(name)
+            # Construct names for quantization scale tensors
+            # These follow the naming convention: module_name.weight_scale and module_name.input_scale
             weight_scale_name = name + ".weight_scale"
             input_scale_name = name + ".input_scale"
-            if weight_scale_name not in tensors:
+
+            # Verify that required scale tensors exist in the loaded data
+            if weight_scale_name not in scale_tensors:
                 print(f"Weight scale tensor {weight_scale_name} not found")
                 continue
-
-            if input_scale_name not in tensors:
+            if input_scale_name not in scale_tensors:
                 print(f"Input scale tensor {input_scale_name} not found")
                 continue
-            
-            #weight_data = tensors[name+".weight"].to(torch.float32)
-            
-            weight_amax = tensors[weight_scale_name] * 448.0
-            input_amax = tensors[input_scale_name] * 448.0
-            #dequantized_weight_data = weight_data * weight_scale
-            module.weight.data = module.weight.to(torch.float32) * tensors[weight_scale_name]
+
+            # Calculate amax values for quantization
+            # FP8 E4M3 format has a maximum representable value of 448.0
+            weight_scale = scale_tensors.pop(weight_scale_name)
+            weight_amax = weight_scale * 448.0
+            input_amax = scale_tensors.pop(input_scale_name) * 448.0
+
+            # Apply dequantization to the original quantized weight using the scale
+            # This ensures the weight is in the correct range for the quantized layer
+            module.weight.data = module.weight.to(torch.float32) * weight_scale
+
+            # Create the quantized linear layer with calculated amax values
             quantized_module = TensorRTQuantizedLinear(module, input_amax, weight_amax)
 
-            # Replace in parent module
+            # Replace the original module with the quantized version
+            # Extract parent module name and child module name
             parent_name = ".".join(name.split(".")[:-1])
             child_name = name.split(".")[-1]
-            
-            # update state_dict
-            #quantized_module.weight.data = dequantized_weight_data
+
             if parent_name:
+                # Get the parent module and replace the child
                 parent_module = model.get_submodule(parent_name)
                 setattr(parent_module, child_name, quantized_module)
             else:
-                # Root module
+                # If no parent, replace at model level
                 setattr(model, child_name, quantized_module)
-    
+
+    if len(scale_tensors) > 0:
+        print(f"Warning: {len(scale_tensors)} scale tensors not used")
     return model
