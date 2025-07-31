@@ -12,13 +12,15 @@ import copy
 import os
 import timeit
 from contextlib import nullcontext
-
+import json
 # %%
 # Imports and Model Definition
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 import torch
 import torch_tensorrt
+import torch.nn as nn
 from torchtrt_ext import register_sdpa
+from torchtrt_ext import register_dequant
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils import (
     export_llm,
@@ -26,11 +28,115 @@ from utils import (
     generate_with_static_cache,
     record_stats,
     time_generate,
+    quantize_model,
 )
+import huggingface_hub
+from huggingface_hub import snapshot_download
+
+import modelopt.torch.quantization as mtq
+from safetensors import safe_open
 
 DEVICE = torch.device("cuda:0")
 
+quantize_op = torch.ops.tensorrt.quantize_op
+dequantize_op = torch.ops.torchtrt_ex.dequantize_op
+class TensorRTQuantizedLinear(torch.nn.Module):
+    """TensorRT quantized linear layer."""
+    
+    def __init__(self, original_linear: nn.Linear, input_amax, weight_scale):
+        super().__init__()
+        self.original_linear = original_linear
+        
+        # Copy the original weights and bias
+        #self.weight = nn.Parameter(original_linear.weight.clone()).cuda()
+        if original_linear.bias is not None:
+            self.bias = nn.Parameter(original_linear.bias.clone()).cuda()
+        else:
+            self.bias = None
+        
+        # Quantization parameters
+        self.input_amax = nn.Parameter(input_amax).cuda()
+        self.weight_scale = nn.Parameter(weight_scale).cuda()
+    
+    def forward(self, x):
+        # Quantized forward pass
+        x_quantized = quantize_op(
+            x, self.input_amax, num_bits=8, exponent_bits=4, unsigned=False, narrow_range=False
+        )
+        #weight = (self.weight * self.weight_scale).to(torch.float32)
+        weight = dequantize_op(self.original_linear.weight, self.weight_scale)
+        # Perform quantized linear operation
+        output = torch.nn.functional.linear(x_quantized, weight, self.bias)
+        #output = torch.ops.aten.linear.default(
+        #    x_quantized,
+        #    self.weight,
+        #    self.bias
+        #)
 
+        return output
+    
+def download_hf_model(model: str):
+    ignore_patterns = ["original/**/*"]
+    
+    hf_folder = snapshot_download(
+        model,
+        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        ignore_patterns=ignore_patterns,
+        revision=None)
+    return hf_folder
+
+def apply_quantized_linear(model, model_name):
+    if os.path.isdir(model_name):
+        hf_folder = model_name
+    else:
+        hf_folder = download_hf_model(model_name)
+    tensors = {}
+    for file in os.listdir(hf_folder):
+        if file.endswith(".safetensors"):
+            with safe_open(os.path.join(hf_folder, file), framework="pt", device="cpu") as f:
+                # Get all tensor names
+                tensor_names = f.keys()
+                print(f"Available tensors: {tensor_names}")
+                for name in tensor_names:
+                    tensors[name] = f.get_tensor(name)
+
+    for name, module in model.named_modules():
+        target = torch.nn.modules.linear.Linear
+        if isinstance(module, target):
+            #print(name)
+            weight_scale_name = name + ".weight_scale"
+            input_scale_name = name + ".input_scale"
+            if weight_scale_name not in tensors:
+                print(f"Weight scale tensor {weight_scale_name} not found")
+                continue
+
+            if input_scale_name not in tensors:
+                print(f"Input scale tensor {input_scale_name} not found")
+                continue
+            
+            #weight_data = tensors[name+".weight"].to(torch.float32)
+            
+            weight_scale = tensors[weight_scale_name]
+            input_amax = tensors[input_scale_name] * 448.0
+            #dequantized_weight_data = weight_data * weight_scale
+            if module.weight.dtype != torch.float8_e4m3fn:
+                raise RuntimeError("Expected module weight dtype to be float8_e4m3fn, but got {module.weight.dtype}")
+            quantized_module = TensorRTQuantizedLinear(module, input_amax, weight_scale)
+
+            # Replace in parent module
+            parent_name = ".".join(name.split(".")[:-1])
+            child_name = name.split(".")[-1]
+            
+            # update state_dict
+            #quantized_module.weight.data = dequantized_weight_data
+            if parent_name:
+                parent_module = model.get_submodule(parent_name)
+                setattr(parent_module, child_name, quantized_module)
+            else:
+                # Root module
+                setattr(model, child_name, quantized_module)
+    
+    return model
 def get_model(args):
     """
     Load and configure the language model for inference.
@@ -48,6 +154,7 @@ def get_model(args):
         torch.nn.Module: The loaded and configured model ready for inference,
             moved to CUDA device with the specified precision
     """
+
     with torch.no_grad():
         model = (
             AutoModelForCausalLM.from_pretrained(
@@ -58,16 +165,19 @@ def get_model(args):
             .eval()
             .cuda()
         )
-
-    if args.precision == "FP16":
-        model = model.to(torch.float16)
-    elif args.precision == "BF16":
-        model = model.to(torch.bfloat16)
+    # Do not convert model parameter dtypes when using pre-quantized models
+    if args.pre_quantized:
+        model = apply_quantized_linear(model, args.model)
+        assert args.precision == "None", "Precision should be None when using pre-quantized models"
     else:
-        model = model.to(torch.float32)
+        if args.precision == "FP16":
+            model = model.to(torch.float16)
+        elif args.precision == "BF16":
+            model = model.to(torch.bfloat16)
+        else:
+            model = model.to(torch.float32)
 
     return model
-
 
 def compile_torchtrt(model, input_ids, args):
     """
@@ -105,8 +215,20 @@ def compile_torchtrt(model, input_ids, args):
         use_fp32_acc = False
     else:
         enabled_precisions = {torch.float32}
-
-    with torch_tensorrt.logging.debug() if args.debug else nullcontext():
+    
+    qformat = "_q_"+ args.qformat if args.qformat else ""
+    
+    logging_dir = f"./{args.model}_{args.precision}{qformat}"
+    #with torch_tensorrt.logging.debug() if args.debug else nullcontext():
+    with torch_tensorrt.dynamo.Debugger(
+        "debug",
+        logging_dir=logging_dir,
+        #capture_fx_graph_after=["constant_fold"],
+        #save_engine_profile=True,
+        #profile_format="trex",
+        engine_builder_monitor=False,
+        #save_layer_info=True,
+    ) if args.debug else nullcontext():
         trt_model = torch_tensorrt.dynamo.compile(
             ep,
             inputs=[input_ids, position_ids],
@@ -234,13 +356,26 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--benchmark", action="store_true", help="Enable benchmark (default: False)"
     )
-
+    arg_parser.add_argument(
+        "--qformat",
+        help=(
+            "Quantization format"
+        ),
+        default=None,
+    )
+    arg_parser.add_argument(
+        "--pre_quantized",
+        action="store_true",
+        help="Use pre-quantized model weights (default: False)",
+    )
     args = arg_parser.parse_args()
     with torch.inference_mode():
         model = get_model(args)
 
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
-
+        # Set pad token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         # Prepare input for benchmarking or evaluation
         if args.benchmark:
             input_ids = torch.randint(
@@ -257,7 +392,8 @@ if __name__ == "__main__":
         pyt_gen_tokens = None
         pyt_timings = None
         pyt_stats = None
-
+        if args.qformat == "fp8":
+            model = quantize_model(model, tokenizer)
         if args.enable_pytorch_run:
             pyt_gen_tokens = generate(
                 model, input_ids.clone(), MAX_OUTPUT_SEQ_LENGTH, tokenizer.eos_token_id
@@ -336,6 +472,9 @@ if __name__ == "__main__":
                 batch_size=args.batch_size,
                 compile_time_s=None,
             )
+        match_result = "N/A"
+        model_name = args.model.replace("/", "_")
+        qformat = args.qformat if args.qformat else "no_quant"
 
         if not args.benchmark:
             if args.enable_pytorch_run:
@@ -347,8 +486,24 @@ if __name__ == "__main__":
                 print(
                     f"PyTorch and TensorRT outputs match: {torch.equal(pyt_gen_tokens, trt_gen_tokens)}"
                 )
-
+                match_result = str(torch.equal(pyt_gen_tokens, trt_gen_tokens))
+                out_json_file = f"{model_name}_{qformat}_match.json"
+                result = {}
+                result["match"] = match_result
+                with open(os.path.join("result", out_json_file), "w") as f:
+                    json.dump(result, f, indent=4)
+                    print(f"Results saved to {out_json_file}")
         if args.benchmark:
+            result = {}
+            args_dict = vars(args)
+            
+            result["args"] = args_dict
+            result["pyt_stats"] = pyt_stats if args.enable_pytorch_run else None
+            result["trt_stats"] = trt_stats if args.benchmark else None
+            out_json_file = f"{model_name}_{qformat}_benchmark.json"            
+            with open(os.path.join("result0731", out_json_file), "w") as f:
+                json.dump(result, f, indent=4)
+                print(f"Results saved to {out_json_file}")
             if args.enable_pytorch_run:
                 print("=========PyTorch PERFORMANCE============ \n")
                 print(pyt_stats)
