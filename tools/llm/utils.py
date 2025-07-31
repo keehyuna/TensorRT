@@ -1,6 +1,6 @@
 import copy
 import timeit
-
+import os
 import numpy as np
 import torch
 from transformers import StoppingCriteriaList
@@ -14,7 +14,9 @@ from modelopt.torch.utils.dataset_utils import (
     get_dataset_dataloader,
 )
 from modelopt.torch.quantization.utils import export_torch_mode
-
+import huggingface_hub
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
 def export_llm(model, inputs, min_seq_len=1, max_seq_len=16):
     """
     Exports the LLM model into an ExportedProgram with dynamic shapes.
@@ -263,4 +265,100 @@ def quantize_model(model, tokenizer):
     model = mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
     print(f"Quantization done.")
 
+    return model
+
+quantize_op = torch.ops.tensorrt.quantize_op
+
+class TensorRTQuantizedLinear(torch.nn.Module):
+    """TensorRT quantized linear layer."""
+    
+    def __init__(self, original_linear: torch.nn.Linear, input_amax, weight_amax):
+        super().__init__()
+        self.original_linear = original_linear
+        
+        # Copy the original weights and bias
+        #self.weight = nn.Parameter(original_linear.weight.clone()).cuda()
+        if original_linear.bias is not None:
+            self.bias = torch.nn.Parameter(original_linear.bias.clone()).cuda()
+        else:
+            self.bias = None
+        
+        # Quantization parameters
+        self.input_amax = torch.nn.Parameter(input_amax).cuda()
+        self.weight_amax = torch.nn.Parameter(weight_amax).cuda()
+    
+    def forward(self, x):
+        # Quantized forward pass
+        x_quantized = quantize_op(
+            x, self.input_amax, num_bits=8, exponent_bits=4, unsigned=False, narrow_range=False
+        )
+        #weight = (self.weight * self.weight_scale).to(torch.float32)
+        quantized_weight = quantize_op(
+            self.original_linear.weight, self.weight_amax, num_bits=8, exponent_bits=4, unsigned=False, narrow_range=False
+        )
+
+        # Perform quantized linear operation
+        return torch.nn.functional.linear(x_quantized, quantized_weight, self.bias)
+        
+    
+def download_hf_model(model: str):
+    ignore_patterns = ["original/**/*"]
+    
+    hf_folder = snapshot_download(
+        model,
+        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        ignore_patterns=ignore_patterns,
+        revision=None)
+    return hf_folder
+
+def convert_linear_to_tensorrt_quantized(model, model_name):
+    if os.path.isdir(model_name):
+        hf_folder = model_name
+    else:
+        hf_folder = download_hf_model(model_name)
+    tensors = {}
+    for file in os.listdir(hf_folder):
+        if file.endswith(".safetensors"):
+            with safe_open(os.path.join(hf_folder, file), framework="pt", device="cpu") as f:
+                # Get all tensor names
+                tensor_names = f.keys()
+                print(f"Available tensors: {tensor_names}")
+                for name in tensor_names:
+                    tensors[name] = f.get_tensor(name)
+
+    for name, module in model.named_modules():
+        target = torch.nn.modules.linear.Linear
+        if isinstance(module, target):
+            #print(name)
+            weight_scale_name = name + ".weight_scale"
+            input_scale_name = name + ".input_scale"
+            if weight_scale_name not in tensors:
+                print(f"Weight scale tensor {weight_scale_name} not found")
+                continue
+
+            if input_scale_name not in tensors:
+                print(f"Input scale tensor {input_scale_name} not found")
+                continue
+            
+            #weight_data = tensors[name+".weight"].to(torch.float32)
+            
+            weight_amax = tensors[weight_scale_name] * 448.0
+            input_amax = tensors[input_scale_name] * 448.0
+            #dequantized_weight_data = weight_data * weight_scale
+            module.weight.data = module.weight.to(torch.float32) * tensors[weight_scale_name]
+            quantized_module = TensorRTQuantizedLinear(module, input_amax, weight_amax)
+
+            # Replace in parent module
+            parent_name = ".".join(name.split(".")[:-1])
+            child_name = name.split(".")[-1]
+            
+            # update state_dict
+            #quantized_module.weight.data = dequantized_weight_data
+            if parent_name:
+                parent_module = model.get_submodule(parent_name)
+                setattr(parent_module, child_name, quantized_module)
+            else:
+                # Root module
+                setattr(model, child_name, quantized_module)
+    
     return model

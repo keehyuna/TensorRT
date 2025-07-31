@@ -18,9 +18,7 @@ import json
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 import torch
 import torch_tensorrt
-import torch.nn as nn
 from torchtrt_ext import register_sdpa
-from torchtrt_ext import register_dequant
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils import (
     export_llm,
@@ -29,114 +27,11 @@ from utils import (
     record_stats,
     time_generate,
     quantize_model,
+    convert_linear_to_tensorrt_quantized,
 )
-import huggingface_hub
-from huggingface_hub import snapshot_download
-
-import modelopt.torch.quantization as mtq
-from safetensors import safe_open
 
 DEVICE = torch.device("cuda:0")
 
-quantize_op = torch.ops.tensorrt.quantize_op
-dequantize_op = torch.ops.torchtrt_ex.dequantize_op
-class TensorRTQuantizedLinear(torch.nn.Module):
-    """TensorRT quantized linear layer."""
-    
-    def __init__(self, original_linear: nn.Linear, input_amax, weight_scale):
-        super().__init__()
-        self.original_linear = original_linear
-        
-        # Copy the original weights and bias
-        #self.weight = nn.Parameter(original_linear.weight.clone()).cuda()
-        if original_linear.bias is not None:
-            self.bias = nn.Parameter(original_linear.bias.clone()).cuda()
-        else:
-            self.bias = None
-        
-        # Quantization parameters
-        self.input_amax = nn.Parameter(input_amax).cuda()
-        self.weight_scale = nn.Parameter(weight_scale).cuda()
-    
-    def forward(self, x):
-        # Quantized forward pass
-        x_quantized = quantize_op(
-            x, self.input_amax, num_bits=8, exponent_bits=4, unsigned=False, narrow_range=False
-        )
-        #weight = (self.weight * self.weight_scale).to(torch.float32)
-        weight = dequantize_op(self.original_linear.weight, self.weight_scale)
-        # Perform quantized linear operation
-        output = torch.nn.functional.linear(x_quantized, weight, self.bias)
-        #output = torch.ops.aten.linear.default(
-        #    x_quantized,
-        #    self.weight,
-        #    self.bias
-        #)
-
-        return output
-    
-def download_hf_model(model: str):
-    ignore_patterns = ["original/**/*"]
-    
-    hf_folder = snapshot_download(
-        model,
-        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        ignore_patterns=ignore_patterns,
-        revision=None)
-    return hf_folder
-
-def apply_quantized_linear(model, model_name):
-    if os.path.isdir(model_name):
-        hf_folder = model_name
-    else:
-        hf_folder = download_hf_model(model_name)
-    tensors = {}
-    for file in os.listdir(hf_folder):
-        if file.endswith(".safetensors"):
-            with safe_open(os.path.join(hf_folder, file), framework="pt", device="cpu") as f:
-                # Get all tensor names
-                tensor_names = f.keys()
-                print(f"Available tensors: {tensor_names}")
-                for name in tensor_names:
-                    tensors[name] = f.get_tensor(name)
-
-    for name, module in model.named_modules():
-        target = torch.nn.modules.linear.Linear
-        if isinstance(module, target):
-            #print(name)
-            weight_scale_name = name + ".weight_scale"
-            input_scale_name = name + ".input_scale"
-            if weight_scale_name not in tensors:
-                print(f"Weight scale tensor {weight_scale_name} not found")
-                continue
-
-            if input_scale_name not in tensors:
-                print(f"Input scale tensor {input_scale_name} not found")
-                continue
-            
-            #weight_data = tensors[name+".weight"].to(torch.float32)
-            
-            weight_scale = tensors[weight_scale_name]
-            input_amax = tensors[input_scale_name] * 448.0
-            #dequantized_weight_data = weight_data * weight_scale
-            if module.weight.dtype != torch.float8_e4m3fn:
-                raise RuntimeError("Expected module weight dtype to be float8_e4m3fn, but got {module.weight.dtype}")
-            quantized_module = TensorRTQuantizedLinear(module, input_amax, weight_scale)
-
-            # Replace in parent module
-            parent_name = ".".join(name.split(".")[:-1])
-            child_name = name.split(".")[-1]
-            
-            # update state_dict
-            #quantized_module.weight.data = dequantized_weight_data
-            if parent_name:
-                parent_module = model.get_submodule(parent_name)
-                setattr(parent_module, child_name, quantized_module)
-            else:
-                # Root module
-                setattr(model, child_name, quantized_module)
-    
-    return model
 def get_model(args):
     """
     Load and configure the language model for inference.
@@ -165,17 +60,15 @@ def get_model(args):
             .eval()
             .cuda()
         )
-    # Do not convert model parameter dtypes when using pre-quantized models
     if args.pre_quantized:
-        model = apply_quantized_linear(model, args.model)
-        assert args.precision == "None", "Precision should be None when using pre-quantized models"
+        model = convert_linear_to_tensorrt_quantized(model, args.model)
+    
+    if args.precision == "FP16":
+        model = model.to(torch.float16)
+    elif args.precision == "BF16":
+        model = model.to(torch.bfloat16)
     else:
-        if args.precision == "FP16":
-            model = model.to(torch.float16)
-        elif args.precision == "BF16":
-            model = model.to(torch.bfloat16)
-        else:
-            model = model.to(torch.float32)
+        model = model.to(torch.float32)
 
     return model
 
