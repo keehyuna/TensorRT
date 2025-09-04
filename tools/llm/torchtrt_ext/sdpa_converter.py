@@ -19,6 +19,61 @@ from torch_tensorrt.dynamo.types import TRTTensor
 
 logger = logging.getLogger(__name__)
 
+def tril_new(
+    ctx: ConversionContext,
+    target: Union[Target, str],
+    source_ir: Optional[SourceIR],
+    name: str,
+    row: TRTTensor,
+    col: TRTTensor,
+) -> TRTTensor:
+    mask_shape = impl.cat.cat(
+        ctx, target, source_ir, f"{name}_concat", [row, col], -1)
+
+    # Create a static lower-triangular mask with a large, fixed max size
+    max_seq_len = 4096 + 1024
+    tril_mask = np.tril(np.ones((max_seq_len, max_seq_len), dtype=bool))
+    causal_mask_static_np = np.logical_not(np.tril(np.ones((max_seq_len, max_seq_len), dtype=np.bool_), k=0))
+    causal_mask_static = get_trt_tensor(ctx, causal_mask_static_np, name + "_attn_bias")
+
+    slice_layer = ctx.net.add_slice(causal_mask_static, start=(0,0), shape=trt.Dims(), stride=(1, 1))
+    slice_layer.set_input(2, mask_shape)
+    mask = slice_layer.get_output(0)
+
+    return mask
+
+def tril_new2(
+    ctx: ConversionContext,
+    target: Union[Target, str],
+    source_ir: Optional[SourceIR],
+    name: str,
+    row: TRTTensor,
+    col: TRTTensor,
+) -> TRTTensor:
+    MAX_SEQ_LEN = 4096
+    arange_data = np.arange(MAX_SEQ_LEN, dtype=np.int32)
+    arange_const = ctx.net.add_constant([MAX_SEQ_LEN], arange_data).get_output(0)
+
+    slice_layer = ctx.net.add_slice(arange_const, start=(0,), shape=trt.Dims(), stride=(1,))
+    slice_layer.set_input(2, row)
+    row_arange_tensor = slice_layer.get_output(0)
+
+    row_reshape_tensor = impl.shuffle.reshape(
+        ctx, target, source_ir, name + "_reshape_row", row_arange_tensor, [row, 1]
+    )
+
+    slice_layer2 = ctx.net.add_slice(arange_const, start=(0,), shape=trt.Dims(), stride=(1,))
+    slice_layer2.set_input(2, col)
+    col_arange_tensor = slice_layer2.get_output(0)
+
+    col_reshape_tensor = impl.shuffle.reshape(
+        ctx, target, source_ir, name + "_reshape_col", col_arange_tensor, [1, col]
+    )
+
+    mask = impl.elementwise.sub(
+        ctx, target, source_ir, name + "_ge", row_reshape_tensor, col_reshape_tensor
+    )
+    return mask
 
 def tril(
     ctx: ConversionContext,
@@ -69,6 +124,7 @@ def scaled_dot_product_attention(
     is_causal = True
     # implementation as described here: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     use_fp32_acc = kwargs.get("use_fp32_acc", False)
+    use_fp8_quantize = kwargs.get("use_fp8_quantize", True)
     query_dtype = query.dtype
 
     if scale is None:
@@ -97,6 +153,28 @@ def scaled_dot_product_attention(
             key,
             scale,
         )
+    amax = torch.tensor([3.6562])
+    if use_fp8_quantize:
+        key = impl.quantize.quantize(
+                    ctx,
+                    target,
+                    SourceIR.ATEN,
+                    name + "_bmm1_k",
+                    key,
+                    amax,
+                    8,
+                    4,
+                )
+        query = impl.quantize.quantize(
+                    ctx,
+                    target,
+                    SourceIR.ATEN,
+                    name + "_bmm1_q",
+                    query,
+                    amax,
+                    8,
+                    4,
+                )
 
     if use_fp32_acc and query_dtype == trt.float16:
         query = cast_trt_tensor(
@@ -136,8 +214,7 @@ def scaled_dot_product_attention(
             S = impl.shape.shape(ctx, target, source_ir, name + "_shape_1", key, 2)
 
         # generate the mask tensor
-        tril_tensor = tril(ctx, target, source_ir, name + "_tril", L, S)
-
+        tril_tensor = tril_new(ctx, target, source_ir, name + "_tril", L, S)
         temp_mask = impl.unary.logical_not(
             ctx, target, source_ir, name + "_logical_not", tril_tensor
         )
@@ -173,6 +250,29 @@ def scaled_dot_product_attention(
     softmax = impl.normalization.softmax(
         ctx, target, source_ir, name + "_softmax", scaled_add_attn_bias, -1, False
     )
+    if use_fp8_quantize:
+        softmax = impl.quantize.quantize(
+                    ctx,
+                    target,
+                    SourceIR.ATEN,
+                    name + "_bmm2_s",
+                    softmax,
+                    amax,
+                    8,
+                    4,
+                )
+        value = impl.quantize.quantize(
+                    ctx,
+                    target,
+                    SourceIR.ATEN,
+                    name + "_bmm2_v",
+                    value,
+                    amax,
+                    8,
+                    4,
+                )
+
+
     if use_fp32_acc:
         softmax = cast_trt_tensor(
             ctx, softmax, trt.float32, name + "_softmax_cast_to_fp32", target, source_ir
@@ -188,9 +288,23 @@ def scaled_dot_product_attention(
         softmax,
         value,
     )
+
     if use_fp32_acc:
         out = cast_trt_tensor(
             ctx, out, query_dtype, name + "_out_cast_to_fp16", target, source_ir
         )
 
+    if use_fp8_quantize:
+        out = impl.quantize.quantize(
+                    ctx,
+                    target,
+                    SourceIR.ATEN,
+                    name + "_bmm2_o",
+                    out,
+                    amax,
+                    8,
+                    4,
+                )
+
     return out
+

@@ -309,6 +309,10 @@ if __name__ == "__main__":
             # This import is required to register static v2 KV cache transformations as lowering passes
             import static_cache_v2
 
+        input_export_ids = torch.randint(
+            1, 10000, (args.batch_size, 4096), dtype=torch.int64
+        ).to(model.device)
+
         # Compile the model with Torch-TensorRT
         trt_model = compile_torchtrt(model, input_ids, args)
 
